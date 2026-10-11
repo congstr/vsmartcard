@@ -55,6 +55,11 @@ typedef WORD uint16_t;
 #include <string.h>
 #include <sys/types.h>
 
+/* Longer than the Android app's largest selectable ISO-DEP response timeout. */
+#ifndef VPCD_IO_TIMEOUT_SECONDS
+#define VPCD_IO_TIMEOUT_SECONDS 40
+#endif
+
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
 static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer);
 
@@ -63,6 +68,24 @@ static ssize_t recvall(SOCKET sock, void *buffer, size_t size);
 
 static SOCKET opensock(unsigned short port);
 static SOCKET connectsock(const char *hostname, unsigned short port);
+static int set_client_timeout(SOCKET sock);
+
+static int set_client_timeout(SOCKET sock)
+{
+#ifdef _WIN32
+    DWORD timeout = VPCD_IO_TIMEOUT_SECONDS * 1000;
+    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+            (const char *) &timeout, sizeof timeout) == 0 &&
+           setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+            (const char *) &timeout, sizeof timeout) == 0;
+#else
+    struct timeval timeout = { VPCD_IO_TIMEOUT_SECONDS, 0 };
+    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+            &timeout, sizeof timeout) == 0 &&
+           setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+            &timeout, sizeof timeout) == 0;
+#endif
+}
 
 ssize_t sendall(SOCKET sock, const void *buffer, size_t size)
 {
@@ -78,8 +101,11 @@ ssize_t sendall(SOCKET sock, const void *buffer, size_t size)
 #endif
                 (size-sent), MSG_NOSIGNAL);
 
-        if (r < 0)
+        if (r <= 0) {
+            if (r == 0)
+                errno = EPIPE;
             return r;
+        }
 
         sent += r;
     }
@@ -88,11 +114,21 @@ ssize_t sendall(SOCKET sock, const void *buffer, size_t size)
 }
 
 ssize_t recvall(SOCKET sock, void *buffer, size_t size) {
-    return recv(sock, buffer,
+    ssize_t r = recv(sock, buffer,
 #ifdef _WIN32
             (int)
 #endif
             size, MSG_WAITALL|MSG_NOSIGNAL);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            errno = ETIMEDOUT;
+        return -1;
+    }
+    if ((size_t) r != size) {
+        errno = r == 0 ? ECONNRESET : EIO;
+        return -1;
+    }
+    return r;
 }
 
 static SOCKET opensock(unsigned short port)
@@ -168,10 +204,11 @@ static SOCKET connectsock(const char *hostname, unsigned short port)
 #ifdef _WIN32
                     (int)
 #endif
-                    cur->ai_addrlen) != -1)
+                    cur->ai_addrlen) != -1 && set_client_timeout(sock))
 			break;
 
 		close(sock);
+		sock = INVALID_SOCKET;
 	}
 
 err:
@@ -267,7 +304,8 @@ static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer)
 
     /* receive size of message on 2 bytes */
     r = recvall(ctx->client_sock, &size, sizeof size);
-    if (r < sizeof size)
+    /* Equality also catches -1; a signed '<' check is promoted to unsigned. */
+    if (r != sizeof size)
         return r;
 
     size = ntohs(size);
@@ -408,8 +446,13 @@ int vicc_connect(struct vicc_ctx *ctx, long secs, long usecs)
     if (ctx->client_sock == INVALID_SOCKET)
         /* not connected */
         return 0;
-    else
-        return 1;
+
+    if (!set_client_timeout(ctx->client_sock)) {
+        vicc_eject(ctx);
+        return 0;
+    }
+
+    return 1;
 }
 
 int vicc_present(struct vicc_ctx *ctx) {
